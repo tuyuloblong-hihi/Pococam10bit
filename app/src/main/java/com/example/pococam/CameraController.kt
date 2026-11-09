@@ -18,7 +18,7 @@ import android.util.Size
 import android.view.Surface
 import java.util.concurrent.Executor
 
-data class VideoMode(val width: Int, val height: Int, val fps: Int) {
+data class VideoMode(val width: Int, val height: Int, val fps: Int, val verified: Boolean = true) {
     val label: String get() = (if (height >= 2160) "4K" else "${height}p") + " ${fps}fps"
     val bitrate: Int
         get() = when {
@@ -51,8 +51,8 @@ class CameraController(private val context: Context) {
     private var hlgSupported = false
     private var sensorOrientation = 90
     private var fpsRanges: List<Range<Int>> = emptyList()
+    private val main10 by lazy { HevcRecorder.isMain10EncoderAvailable() }
 
-    // Kapabilitas yang dibaca UI
     var modes: List<VideoMode> = listOf(VideoMode(1920, 1080, 30)); private set
     var mode: VideoMode = modes.first()
     var proSupported = false; private set
@@ -60,12 +60,13 @@ class CameraController(private val context: Context) {
     var isoRange: Range<Int> = Range(100, 3200); private set
     var expRange: Range<Long> = Range(125_000L, 33_333_333L); private set
 
-    // Nilai auto terakhir (untuk titik awal slider saat pindah ke manual)
+    @Volatile var lastError: String? = null
+    @Volatile var onFailure: ((String) -> Unit)? = null
+
     @Volatile var liveIso = 100; private set
     @Volatile var liveExp = 16_666_666L; private set
     @Volatile private var autoGains: RggbChannelVector? = null
     @Volatile private var ccm: ColorSpaceTransform? = null
-
     @Volatile private var pro = ProSettings()
 
     private var device: CameraDevice? = null
@@ -77,86 +78,132 @@ class CameraController(private val context: Context) {
     private var activeTargets: List<Surface> = emptyList()
     private var activeFps = 30
 
-    /** Panggil sekali (tidak butuh izin kamera). */
     fun load() {
         if (cameraId != null) return
-        var fallback: String? = null
-        for (id in manager.cameraIdList) {
-            val c = manager.getCameraCharacteristics(id)
-            if (c.get(CameraCharacteristics.LENS_FACING) != CameraCharacteristics.LENS_FACING_BACK) continue
-            if (fallback == null) fallback = id
-            if (Build.VERSION.SDK_INT >= 33) {
-                val p = c.get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES)
-                if (p != null && p.supportedProfiles.contains(DynamicRangeProfiles.HLG10)) {
-                    cameraId = id; hlgSupported = true; break
+        try {
+            var fallback: String? = null
+            for (id in manager.cameraIdList) {
+                val c = manager.getCameraCharacteristics(id)
+                if (c.get(CameraCharacteristics.LENS_FACING) != CameraCharacteristics.LENS_FACING_BACK) continue
+                if (fallback == null) fallback = id
+                if (Build.VERSION.SDK_INT >= 33) {
+                    val p = c.get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES)
+                    if (p != null && p.supportedProfiles.contains(DynamicRangeProfiles.HLG10)) {
+                        cameraId = id; hlgSupported = true; break
+                    }
                 }
             }
-        }
-        if (cameraId == null) cameraId = fallback
-        val chars = manager.getCameraCharacteristics(cameraId!!)
-        sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+            if (cameraId == null) cameraId = fallback
+            val chars = manager.getCameraCharacteristics(cameraId!!)
+            sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
 
-        val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toList() ?: emptyList()
-        proSupported = caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)
-        wbSupported = caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_POST_PROCESSING)
-        chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { isoRange = it }
-        chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let { expRange = it }
-        fpsRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.toList() ?: emptyList()
+            val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toList() ?: emptyList()
+            proSupported = caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)
+            wbSupported = caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_POST_PROCESSING)
+            chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { isoRange = it }
+            chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let { expRange = it }
+            fpsRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.toList() ?: emptyList()
 
-        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
-        val sizes = map.getOutputSizes(MediaCodec::class.java).toList()
-        val found = listOf(
-            Triple(3840, 2160, 30), Triple(3840, 2160, 60),
-            Triple(1920, 1080, 60), Triple(1920, 1080, 30)
-        ).mapNotNull { (w, h, f) ->
-            val s = Size(w, h)
-            if (!sizes.contains(s)) return@mapNotNull null
-            val d = map.getOutputMinFrameDuration(MediaCodec::class.java, s)
-            val maxFps = if (d > 0) 1_000_000_000.0 / d else 30.0
-            if (maxFps + 0.5 < f) return@mapNotNull null
-            if (fpsRanges.none { it.lower <= f && it.upper >= f }) return@mapNotNull null
-            VideoMode(w, h, f)
+            val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val sizes = map?.getOutputSizes(MediaCodec::class.java)?.toList() ?: emptyList()
+            val found = listOf(
+                Triple(3840, 2160, 30), Triple(3840, 2160, 60),
+                Triple(1920, 1080, 60), Triple(1920, 1080, 30)
+            ).mapNotNull { (w, h, f) ->
+                val s = Size(w, h)
+                if (!sizes.contains(s)) return@mapNotNull null
+                var ok = fpsRanges.any { it.upper >= f }
+                if (f > 30 && map != null) {
+                    val d = map.getOutputMinFrameDuration(MediaCodec::class.java, s)
+                    if (d > 0 && 1e9 / d + 0.5 < f) ok = false
+                }
+                // 60fps tetap ditampilkan; tanda * = kamera tidak mengumumkan dukungannya
+                VideoMode(w, h, f, verified = f <= 30 || ok)
+            }
+            if (found.isNotEmpty()) { modes = found; mode = found.first() }
+        } catch (e: Exception) {
+            lastError = "load: ${e.javaClass.simpleName} ${e.message}"
         }
-        if (found.isNotEmpty()) { modes = found; mode = found.first() }
     }
 
-    /** null = HLG10 bisa dipakai; selain itu alasan kenapa tidak. */
     fun hdrReason(): String? = when {
         Build.VERSION.SDK_INT < 33 -> "Android di bawah 13"
         !hlgSupported -> "kamera tidak mengekspos HLG10"
-        !HevcRecorder.isMain10EncoderAvailable() -> "encoder HEVC Main10 tidak tersedia"
+        !main10 -> "encoder HEVC Main10 tidak tersedia"
         else -> null
+    }
+
+    fun diagnostics(): String {
+        val sb = StringBuilder()
+        sb.append("${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})\n")
+        sb.append("Kamera dipakai: $cameraId · HLG10 terdeteksi: $hlgSupported · Encoder Main10: $main10\n")
+        sb.append("Mode: ${modes.joinToString { it.label + if (it.verified) "" else "*" }}\n")
+        lastError?.let { sb.append("Error terakhir: $it\n") }
+        try {
+            for (id in manager.cameraIdList) {
+                val c = manager.getCameraCharacteristics(id)
+                sb.append("\n[Kamera $id] facing=${c.get(CameraCharacteristics.LENS_FACING)}\n")
+                sb.append(" caps=${c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.joinToString(",")}\n")
+                if (Build.VERSION.SDK_INT >= 33) {
+                    val p = c.get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES)
+                    sb.append(" dynRange=${p?.supportedProfiles?.joinToString(",") ?: "null"} (1=SDR, 2=HLG10)\n")
+                }
+                sb.append(" physical=${c.physicalCameraIds.joinToString(",")}\n")
+                sb.append(" aeFps=${c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.joinToString(" ")}\n")
+                val hs = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)?.highSpeedVideoSizes
+                sb.append(" highSpeed=${hs?.joinToString(",") { "${it.width}x${it.height}" } ?: "-"}\n")
+            }
+        } catch (e: Exception) {
+            sb.append("\ndiagnostik gagal: ${e.message}")
+        }
+        return sb.toString()
     }
 
     private fun rangeFor(fps: Int): Range<Int>? =
         fpsRanges.filter { it.upper == fps }.maxByOrNull { it.lower }
-            ?: fpsRanges.firstOrNull { it.upper >= fps }
+            ?: fpsRanges.filter { it.upper > fps }.minByOrNull { it.upper }
 
     @SuppressLint("MissingPermission")
     fun open(previewSurface: Surface) {
         preview = previewSurface
         load()
-        manager.openCamera(cameraId!!, object : CameraDevice.StateCallback() {
-            override fun onOpened(camera: CameraDevice) { device = camera; startPreview() }
-            override fun onDisconnected(camera: CameraDevice) { camera.close() }
-            override fun onError(camera: CameraDevice, error: Int) {
-                Log.e(TAG, "Camera error $error"); camera.close()
-            }
-        }, handler)
+        try {
+            manager.openCamera(cameraId!!, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) { device = camera; startPreview() }
+                override fun onDisconnected(camera: CameraDevice) { camera.close() }
+                override fun onError(camera: CameraDevice, error: Int) {
+                    Log.e(TAG, "Camera error $error"); camera.close()
+                    lastError = "Kamera error $error"
+                    onFailure?.invoke("Kamera error $error")
+                }
+            }, handler)
+        } catch (e: Exception) {
+            lastError = "open: ${e.message}"
+            onFailure?.invoke("Gagal membuka kamera: ${e.message}")
+        }
     }
 
-    private fun createSession(surfaces: List<Surface>, hlg: Boolean, onReady: (CameraCaptureSession) -> Unit) {
-        val dev = device ?: return
-        val configs = surfaces.map { s ->
-            OutputConfiguration(s).also {
-                if (hlg && Build.VERSION.SDK_INT >= 33) it.setDynamicRangeProfile(DynamicRangeProfiles.HLG10)
+    private fun createSession(
+        surfaces: List<Surface>, hlg: Boolean,
+        onFail: (String) -> Unit, onReady: (CameraCaptureSession) -> Unit
+    ) {
+        val dev = device ?: return onFail("Kamera belum terbuka")
+        try {
+            val configs = surfaces.map { s ->
+                OutputConfiguration(s).also {
+                    if (hlg && Build.VERSION.SDK_INT >= 33) it.setDynamicRangeProfile(DynamicRangeProfiles.HLG10)
+                }
             }
+            val cb = object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(s: CameraCaptureSession) { session = s; onReady(s) }
+                override fun onConfigureFailed(s: CameraCaptureSession) {
+                    onFail("Konfigurasi sesi kamera ditolak (kombinasi resolusi/fps/HLG tidak didukung)")
+                }
+            }
+            dev.createCaptureSession(SessionConfiguration(SessionConfiguration.SESSION_REGULAR, configs, executor, cb))
+        } catch (e: Exception) {
+            onFail("Sesi kamera: ${e.javaClass.simpleName} ${e.message}")
         }
-        val cb = object : CameraCaptureSession.StateCallback() {
-            override fun onConfigured(s: CameraCaptureSession) { session = s; onReady(s) }
-            override fun onConfigureFailed(s: CameraCaptureSession) { Log.e(TAG, "Session configure failed") }
-        }
-        dev.createCaptureSession(SessionConfiguration(SessionConfiguration.SESSION_REGULAR, configs, executor, cb))
     }
 
     private val captureCb = object : CameraCaptureSession.CaptureCallback() {
@@ -197,7 +244,6 @@ class CameraController(private val context: Context) {
         return b.build()
     }
 
-    /** Terapkan pengaturan PRO ke request yang sedang berjalan (preview maupun rekam). */
     fun updatePro(p: ProSettings) {
         pro = p
         handler.post {
@@ -211,51 +257,68 @@ class CameraController(private val context: Context) {
         activeTemplate = CameraDevice.TEMPLATE_PREVIEW
         activeTargets = listOf(p)
         activeFps = 30
-        createSession(listOf(p), false) { s ->
-            s.setRepeatingRequest(buildRequest(), captureCb, handler)
+        createSession(listOf(p), false, { Log.e(TAG, "Preview gagal: $it"); lastError = it }) { s ->
+            runCatching { s.setRepeatingRequest(buildRequest(), captureCb, handler) }
+                .onFailure { Log.e(TAG, "Preview request gagal", it) }
         }
     }
 
+    private fun err(msg: String): RecInfo? { lastError = msg; return null }
+
     fun startRecording(want10Bit: Boolean): RecInfo? {
-        val p = preview ?: return null
-        if (device == null) return null
+        val p = preview ?: return err("Preview belum siap")
+        if (device == null) return err("Kamera belum terbuka")
         val hlg = want10Bit && hdrReason() == null
         val m = mode
         return try {
-            val rec = HevcRecorder(context)
+            val rec = HevcRecorder(context) { msg -> handler.post { failRecording(msg) } }
+            recorder = rec
             val hint = (sensorOrientation - 90 + 360) % 360 // asumsi landscape
             rec.prepare(Size(m.width, m.height), m.fps, m.bitrate, hlg, hint)
-            recorder = rec
             val rs = rec.inputSurface!!
             activeTemplate = CameraDevice.TEMPLATE_RECORD
             activeTargets = listOf(p, rs)
             activeFps = m.fps
-            createSession(listOf(p, rs), hlg) { s ->
-                rec.start()
-                s.setRepeatingRequest(buildRequest(), captureCb, handler)
+            createSession(listOf(p, rs), hlg, { failRecording("${m.label}: $it") }) { s ->
+                try {
+                    rec.start()
+                    s.setRepeatingRequest(buildRequest(), captureCb, handler)
+                } catch (e: Exception) {
+                    failRecording("Mulai rekam: ${e.javaClass.simpleName} ${e.message}")
+                }
             }
-            RecInfo(hlg, "${m.label} · HEVC " + if (hlg) "10-bit HLG" else "8-bit SDR")
+            RecInfo(hlg, "${m.label} · HEVC " + (if (hlg) "10-bit HLG" else "8-bit") +
+                if (rec.hasAudio) "" else " · tanpa audio")
         } catch (e: Exception) {
-            Log.e(TAG, "startRecording gagal", e)
-            recorder?.stop(); recorder = null
-            null
+            runCatching { recorder?.stop() }
+            recorder = null
+            err("${m.label}: ${e.javaClass.simpleName} ${e.message}")
         }
+    }
+
+    private fun failRecording(msg: String) {
+        if (recorder == null) return
+        lastError = msg
+        runCatching { recorder?.stop() }
+        recorder = null
+        startPreview()
+        onFailure?.invoke(msg)
     }
 
     fun stopRecording() {
         runCatching { session?.stopRepeating() }
-        recorder?.stop()
+        runCatching { recorder?.stop() }
         recorder = null
         startPreview()
     }
 
     fun close() {
-        recorder?.stop(); recorder = null
-        session?.close(); session = null
-        device?.close(); device = null
+        runCatching { recorder?.stop() }; recorder = null
+        runCatching { session?.close() }; session = null
+        runCatching { device?.close() }; device = null
     }
 
-    // --- White balance: estimasi gain relatif terhadap nilai auto saat AWB dimatikan ---
+    // --- White balance: estimasi gain relatif terhadap nilai auto ---
     private fun gainsFor(k: Int): RggbChannelVector {
         val base = autoGains ?: RggbChannelVector(2.0f, 1f, 1f, 1.8f)
         val ref = kelvinRgb(5500)
