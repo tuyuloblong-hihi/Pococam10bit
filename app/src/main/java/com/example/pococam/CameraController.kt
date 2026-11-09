@@ -3,8 +3,10 @@ package com.example.pococam
 import android.annotation.SuppressLint
 import android.content.Context
 import android.hardware.camera2.*
+import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.DynamicRangeProfiles
 import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.RggbChannelVector
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.MediaCodec
 import android.os.Build
@@ -15,6 +17,27 @@ import android.util.Range
 import android.util.Size
 import android.view.Surface
 import java.util.concurrent.Executor
+
+data class VideoMode(val width: Int, val height: Int, val fps: Int) {
+    val label: String get() = (if (height >= 2160) "4K" else "${height}p") + " ${fps}fps"
+    val bitrate: Int
+        get() = when {
+            height >= 2160 && fps >= 60 -> 80_000_000
+            height >= 2160 -> 50_000_000
+            fps >= 60 -> 30_000_000
+            else -> 20_000_000
+        }
+}
+
+data class ProSettings(
+    val autoExposure: Boolean = true,
+    val iso: Int = 100,
+    val shutterNs: Long = 16_666_666L,
+    val autoWb: Boolean = true,
+    val kelvin: Int = 5500
+)
+
+data class RecInfo(val active10Bit: Boolean, val summary: String)
 
 class CameraController(private val context: Context) {
 
@@ -27,15 +50,36 @@ class CameraController(private val context: Context) {
     private var cameraId: String? = null
     private var hlgSupported = false
     private var sensorOrientation = 90
-    private var videoSize = Size(1920, 1080)
+    private var fpsRanges: List<Range<Int>> = emptyList()
+
+    // Kapabilitas yang dibaca UI
+    var modes: List<VideoMode> = listOf(VideoMode(1920, 1080, 30)); private set
+    var mode: VideoMode = modes.first()
+    var proSupported = false; private set
+    var wbSupported = false; private set
+    var isoRange: Range<Int> = Range(100, 3200); private set
+    var expRange: Range<Long> = Range(125_000L, 33_333_333L); private set
+
+    // Nilai auto terakhir (untuk titik awal slider saat pindah ke manual)
+    @Volatile var liveIso = 100; private set
+    @Volatile var liveExp = 16_666_666L; private set
+    @Volatile private var autoGains: RggbChannelVector? = null
+    @Volatile private var ccm: ColorSpaceTransform? = null
+
+    @Volatile private var pro = ProSettings()
 
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var preview: Surface? = null
     private var recorder: HevcRecorder? = null
-    private val fps = 30
 
-    private fun pickCamera() {
+    private var activeTemplate = CameraDevice.TEMPLATE_PREVIEW
+    private var activeTargets: List<Surface> = emptyList()
+    private var activeFps = 30
+
+    /** Panggil sekali (tidak butuh izin kamera). */
+    fun load() {
+        if (cameraId != null) return
         var fallback: String? = null
         for (id in manager.cameraIdList) {
             val c = manager.getCameraCharacteristics(id)
@@ -51,88 +95,20 @@ class CameraController(private val context: Context) {
         if (cameraId == null) cameraId = fallback
         val chars = manager.getCameraCharacteristics(cameraId!!)
         sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-        val sizes = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
-            .getOutputSizes(MediaCodec::class.java)
-        videoSize = if (sizes.contains(Size(3840, 2160))) Size(3840, 2160) else Size(1920, 1080)
-    }
 
-    @SuppressLint("MissingPermission")
-    fun open(previewSurface: Surface) {
-        preview = previewSurface
-        if (cameraId == null) pickCamera()
-        manager.openCamera(cameraId!!, object : CameraDevice.StateCallback() {
-            override fun onOpened(camera: CameraDevice) { device = camera; startPreview() }
-            override fun onDisconnected(camera: CameraDevice) { camera.close() }
-            override fun onError(camera: CameraDevice, error: Int) {
-                Log.e(TAG, "Camera error $error"); camera.close()
-            }
-        }, handler)
-    }
+        val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toList() ?: emptyList()
+        proSupported = caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)
+        wbSupported = caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_POST_PROCESSING)
+        chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { isoRange = it }
+        chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let { expRange = it }
+        fpsRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.toList() ?: emptyList()
 
-    private fun createSession(surfaces: List<Surface>, hlg: Boolean, onReady: (CameraCaptureSession) -> Unit) {
-        val dev = device ?: return
-        val configs = surfaces.map { s ->
-            OutputConfiguration(s).also {
-                if (hlg && Build.VERSION.SDK_INT >= 33) it.setDynamicRangeProfile(DynamicRangeProfiles.HLG10)
-            }
-        }
-        val cb = object : CameraCaptureSession.StateCallback() {
-            override fun onConfigured(s: CameraCaptureSession) { session = s; onReady(s) }
-            override fun onConfigureFailed(s: CameraCaptureSession) { Log.e(TAG, "Session configure failed") }
-        }
-        dev.createCaptureSession(SessionConfiguration(SessionConfiguration.SESSION_REGULAR, configs, executor, cb))
-    }
-
-    private fun startPreview() {
-        val dev = device ?: return
-        val p = preview ?: return
-        createSession(listOf(p), false) { s ->
-            val req = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                addTarget(p)
-                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
-            }
-            s.setRepeatingRequest(req.build(), null, handler)
-        }
-    }
-
-    /** Return label mode yang dipakai, atau null jika gagal. */
-    fun startRecording(want10Bit: Boolean): String? {
-        val dev = device ?: return null
-        val p = preview ?: return null
-        val hlg = want10Bit && hlgSupported && HevcRecorder.isMain10EncoderAvailable()
-        return try {
-            val rec = HevcRecorder(context)
-            val bitrate = if (videoSize.width >= 3840) 50_000_000 else 20_000_000
-            // Asumsi UI landscape (ROTATION_90)
-            val hint = (sensorOrientation - 90 + 360) % 360
-            rec.prepare(videoSize, fps, bitrate, hlg, hint)
-            recorder = rec
-            val rs = rec.inputSurface!!
-            createSession(listOf(p, rs), hlg) { s ->
-                val req = dev.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                    addTarget(p); addTarget(rs)
-                    set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
-                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps, fps))
-                }
-                rec.start()
-                s.setRepeatingRequest(req.build(), null, handler)
-            }
-            "${videoSize.width}x${videoSize.height} HEVC " + if (hlg) "10-bit HLG" else "8-bit"
-        } catch (e: Exception) {
-            Log.e(TAG, "startRecording failed", e); recorder?.stop(); recorder = null; null
-        }
-    }
-
-    fun stopRecording() {
-        runCatching { session?.stopRepeating() }
-        recorder?.stop()
-        recorder = null
-        startPreview()
-    }
-
-    fun close() {
-        recorder?.stop(); recorder = null
-        session?.close(); session = null
-        device?.close(); device = null
-    }
-}
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
+        val sizes = map.getOutputSizes(MediaCodec::class.java).toList()
+        val found = listOf(
+            Triple(3840, 2160, 30), Triple(3840, 2160, 60),
+            Triple(1920, 1080, 60), Triple(1920, 1080, 30)
+        ).mapNotNull { (w, h, f) ->
+            val s = Size(w, h)
+            if (!sizes.contains(s)) return@mapNotNull null
+            val d = map.getOutputMinFrameDuration(
