@@ -15,8 +15,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
@@ -40,6 +42,7 @@ import kotlin.math.roundToInt
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CrashLog.install(this)
         setContent { CameraScreen() }
     }
 }
@@ -114,6 +117,9 @@ fun CameraScreen() {
     var proOpen by remember { mutableStateOf(false) }
     var pro by remember { mutableStateOf(ProSettings()) }
 
+    var report by remember { mutableStateOf(CrashLog.read(context)) }
+    var diagOpen by remember { mutableStateOf(false) }
+
     fun setPro(p: ProSettings) { pro = p; controller.updatePro(p) }
 
     val launcher = rememberLauncherForActivityResult(
@@ -121,6 +127,7 @@ fun CameraScreen() {
     ) { r -> granted = r.values.all { it } }
 
     LaunchedEffect(Unit) {
+        controller.onFailure = { msg -> isRecording = false; error = msg }
         if (!granted) launcher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
     }
     LaunchedEffect(granted, surface) {
@@ -133,8 +140,7 @@ fun CameraScreen() {
     }
     DisposableEffect(Unit) { onDispose { controller.close() } }
 
-    // Teks status HLG10 / 10-bit
-    val reason = controller.hdrReason()
+    val reason = remember { controller.hdrReason() }
     val active10 = recInfo?.active10Bit == true
     val hdrText = when {
         isRecording -> if (active10) "● HLG10 · HEVC 10-bit AKTIF" else "● SDR · HEVC 8-bit"
@@ -164,7 +170,7 @@ fun CameraScreen() {
             }
         )
 
-        // Status atas tengah: REC/mode + status HLG10
+        // Status atas tengah
         Column(Modifier.align(Alignment.TopCenter).padding(top = 16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Row(
                 Modifier.clip(RoundedCornerShape(50)).background(Glass).padding(horizontal = 14.dp, vertical = 6.dp),
@@ -186,13 +192,14 @@ fun CameraScreen() {
             error?.let {
                 Spacer(Modifier.height(6.dp))
                 Text(it, color = Red, fontSize = 12.sp,
-                    modifier = Modifier.clip(RoundedCornerShape(50)).background(Glass).padding(horizontal = 12.dp, vertical = 4.dp))
+                    modifier = Modifier.clip(RoundedCornerShape(12.dp)).background(Glass).padding(horizontal = 12.dp, vertical = 4.dp))
             }
         }
 
-        // Kiri atas: tombol PRO
-        Box(Modifier.align(Alignment.TopStart).padding(16.dp)) {
+        // Kiri atas: PRO + INFO
+        Row(Modifier.align(Alignment.TopStart).padding(16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Pill("PRO", selected = proOpen, enabled = controller.proSupported) { proOpen = !proOpen }
+            Pill("INFO", selected = diagOpen) { diagOpen = !diagOpen }
         }
 
         // Kanan atas: switch 10-bit
@@ -213,34 +220,28 @@ fun CameraScreen() {
         ) {
             if (proOpen && controller.proSupported) {
                 val isoMin = controller.isoRange.lower.toDouble().coerceAtLeast(50.0)
-                val isoMax = controller.isoRange.upper.toDouble()
+                val isoMax = controller.isoRange.upper.toDouble().coerceAtLeast(isoMin + 1)
                 val expMin = controller.expRange.lower.toDouble().coerceAtLeast(125_000.0)
-                val expMax = minOf(controller.expRange.upper.toDouble(), 1e9 / mode.fps)
+                val expMax = minOf(controller.expRange.upper.toDouble(), 1e9 / mode.fps).coerceAtLeast(expMin + 1)
 
-                Column(
-                    Modifier.clip(RoundedCornerShape(16.dp)).background(Glass).padding(10.dp)
-                ) {
+                val toManual = {
+                    setPro(pro.copy(
+                        autoExposure = false,
+                        iso = controller.liveIso.coerceIn(isoMin.toInt(), isoMax.toInt()),
+                        shutterNs = controller.liveExp.toDouble().coerceIn(expMin, expMax).toLong()
+                    ))
+                }
+
+                Column(Modifier.clip(RoundedCornerShape(16.dp)).background(Glass).padding(10.dp)) {
                     ProRow(
                         "ISO", "${pro.iso}", pro.autoExposure, true,
-                        onAuto = {
-                            if (pro.autoExposure) {
-                                setPro(pro.copy(autoExposure = false,
-                                    iso = controller.liveIso.coerceIn(isoMin.toInt(), isoMax.toInt()),
-                                    shutterNs = controller.liveExp.toDouble().coerceIn(expMin, expMax).toLong()))
-                            } else setPro(pro.copy(autoExposure = true))
-                        },
+                        onAuto = { if (pro.autoExposure) toManual() else setPro(pro.copy(autoExposure = true)) },
                         value = fromLog(pro.iso.toDouble().coerceIn(isoMin, isoMax), isoMin, isoMax),
                         onValue = { setPro(pro.copy(iso = toLog(it, isoMin, isoMax).roundToInt())) }
                     )
                     ProRow(
                         "SHUTTER", "1/${(1e9 / pro.shutterNs).roundToInt()}", pro.autoExposure, true,
-                        onAuto = {
-                            if (pro.autoExposure) {
-                                setPro(pro.copy(autoExposure = false,
-                                    iso = controller.liveIso.coerceIn(isoMin.toInt(), isoMax.toInt()),
-                                    shutterNs = controller.liveExp.toDouble().coerceIn(expMin, expMax).toLong()))
-                            } else setPro(pro.copy(autoExposure = true))
-                        },
+                        onAuto = { if (pro.autoExposure) toManual() else setPro(pro.copy(autoExposure = true)) },
                         value = fromLog(pro.shutterNs.toDouble().coerceIn(expMin, expMax), expMin, expMax),
                         onValue = { setPro(pro.copy(shutterNs = toLog(it, expMin, expMax).toLong())) }
                     )
@@ -257,12 +258,11 @@ fun CameraScreen() {
                 Spacer(Modifier.height(8.dp))
             }
 
-            // Pemilih resolusi & fps
+            // Pemilih resolusi & fps (* = tidak diumumkan kamera, tetap dicoba)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 controller.modes.forEach { m ->
-                    Pill(m.label, selected = m == mode, enabled = !isRecording) {
+                    Pill(m.label + if (m.verified) "" else "*", selected = m == mode, enabled = !isRecording) {
                         mode = m; controller.mode = m; error = null
-                        // Slider shutter dibatasi 1/fps, sesuaikan jika perlu
                         val maxNs = (1e9 / m.fps).toLong()
                         if (pro.shutterNs > maxNs) setPro(pro.copy(shutterNs = maxNs))
                     }
@@ -277,9 +277,10 @@ fun CameraScreen() {
                 .clickable(enabled = granted) {
                     if (!isRecording) {
                         controller.mode = mode
+                        controller.lastError = null
                         val info = controller.startRecording(want10Bit)
                         if (info != null) { recInfo = info; isRecording = true; error = null }
-                        else error = "Gagal memulai ${mode.label}. Coba mode lain."
+                        else error = controller.lastError ?: "Gagal memulai ${mode.label}"
                     } else {
                         controller.stopRecording()
                         isRecording = false
@@ -290,6 +291,23 @@ fun CameraScreen() {
             val s: Dp = if (isRecording) 28.dp else 62.dp
             val shape = if (isRecording) RoundedCornerShape(8.dp) else CircleShape
             Box(Modifier.size(s).clip(shape).background(Red))
+        }
+
+        // Layar INFO / laporan crash (paling atas)
+        if (diagOpen || report != null) {
+            val text = remember(diagOpen, report) {
+                if (diagOpen) controller.diagnostics() else "CRASH TERAKHIR:\n$report"
+            }
+            Column(Modifier.fillMaxSize().background(Color(0xF2000000)).padding(16.dp)) {
+                Text(
+                    text, color = Color.White, fontSize = 11.sp,
+                    modifier = Modifier.weight(1f).verticalScroll(rememberScrollState())
+                )
+                Spacer(Modifier.height(8.dp))
+                Pill("Tutup") {
+                    CrashLog.clear(context); report = null; diagOpen = false
+                }
+            }
         }
     }
 }
