@@ -111,4 +111,168 @@ class CameraController(private val context: Context) {
         ).mapNotNull { (w, h, f) ->
             val s = Size(w, h)
             if (!sizes.contains(s)) return@mapNotNull null
-            val d = map.getOutputMinFrameDuration(
+            val d = map.getOutputMinFrameDuration(MediaCodec::class.java, s)
+            val maxFps = if (d > 0) 1_000_000_000.0 / d else 30.0
+            if (maxFps + 0.5 < f) return@mapNotNull null
+            if (fpsRanges.none { it.lower <= f && it.upper >= f }) return@mapNotNull null
+            VideoMode(w, h, f)
+        }
+        if (found.isNotEmpty()) { modes = found; mode = found.first() }
+    }
+
+    /** null = HLG10 bisa dipakai; selain itu alasan kenapa tidak. */
+    fun hdrReason(): String? = when {
+        Build.VERSION.SDK_INT < 33 -> "Android di bawah 13"
+        !hlgSupported -> "kamera tidak mengekspos HLG10"
+        !HevcRecorder.isMain10EncoderAvailable() -> "encoder HEVC Main10 tidak tersedia"
+        else -> null
+    }
+
+    private fun rangeFor(fps: Int): Range<Int>? =
+        fpsRanges.filter { it.upper == fps }.maxByOrNull { it.lower }
+            ?: fpsRanges.firstOrNull { it.upper >= fps }
+
+    @SuppressLint("MissingPermission")
+    fun open(previewSurface: Surface) {
+        preview = previewSurface
+        load()
+        manager.openCamera(cameraId!!, object : CameraDevice.StateCallback() {
+            override fun onOpened(camera: CameraDevice) { device = camera; startPreview() }
+            override fun onDisconnected(camera: CameraDevice) { camera.close() }
+            override fun onError(camera: CameraDevice, error: Int) {
+                Log.e(TAG, "Camera error $error"); camera.close()
+            }
+        }, handler)
+    }
+
+    private fun createSession(surfaces: List<Surface>, hlg: Boolean, onReady: (CameraCaptureSession) -> Unit) {
+        val dev = device ?: return
+        val configs = surfaces.map { s ->
+            OutputConfiguration(s).also {
+                if (hlg && Build.VERSION.SDK_INT >= 33) it.setDynamicRangeProfile(DynamicRangeProfiles.HLG10)
+            }
+        }
+        val cb = object : CameraCaptureSession.StateCallback() {
+            override fun onConfigured(s: CameraCaptureSession) { session = s; onReady(s) }
+            override fun onConfigureFailed(s: CameraCaptureSession) { Log.e(TAG, "Session configure failed") }
+        }
+        dev.createCaptureSession(SessionConfiguration(SessionConfiguration.SESSION_REGULAR, configs, executor, cb))
+    }
+
+    private val captureCb = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
+            val p = pro
+            if (p.autoExposure) {
+                res.get(CaptureResult.SENSOR_SENSITIVITY)?.let { liveIso = it }
+                res.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { liveExp = it }
+            }
+            if (p.autoWb) res.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let { autoGains = it }
+            res.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { ccm = it }
+        }
+    }
+
+    private fun buildRequest(): CaptureRequest {
+        val b = device!!.createCaptureRequest(activeTemplate)
+        activeTargets.forEach { b.addTarget(it) }
+        b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+        rangeFor(activeFps)?.let { b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+
+        val p = pro
+        if (!p.autoExposure && proSupported) {
+            val frameNs = 1_000_000_000L / activeFps
+            b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+            b.set(CaptureRequest.SENSOR_SENSITIVITY, p.iso.coerceIn(isoRange.lower, isoRange.upper))
+            b.set(
+                CaptureRequest.SENSOR_EXPOSURE_TIME,
+                p.shutterNs.coerceIn(expRange.lower, expRange.upper).coerceAtMost(frameNs)
+            )
+            b.set(CaptureRequest.SENSOR_FRAME_DURATION, frameNs)
+        }
+        if (!p.autoWb && wbSupported) {
+            b.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
+            b.set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+            b.set(CaptureRequest.COLOR_CORRECTION_GAINS, gainsFor(p.kelvin))
+            ccm?.let { b.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, it) }
+        }
+        return b.build()
+    }
+
+    /** Terapkan pengaturan PRO ke request yang sedang berjalan (preview maupun rekam). */
+    fun updatePro(p: ProSettings) {
+        pro = p
+        handler.post {
+            runCatching { session?.setRepeatingRequest(buildRequest(), captureCb, handler) }
+                .onFailure { Log.e(TAG, "updatePro gagal", it) }
+        }
+    }
+
+    private fun startPreview() {
+        val p = preview ?: return
+        activeTemplate = CameraDevice.TEMPLATE_PREVIEW
+        activeTargets = listOf(p)
+        activeFps = 30
+        createSession(listOf(p), false) { s ->
+            s.setRepeatingRequest(buildRequest(), captureCb, handler)
+        }
+    }
+
+    fun startRecording(want10Bit: Boolean): RecInfo? {
+        val p = preview ?: return null
+        if (device == null) return null
+        val hlg = want10Bit && hdrReason() == null
+        val m = mode
+        return try {
+            val rec = HevcRecorder(context)
+            val hint = (sensorOrientation - 90 + 360) % 360 // asumsi landscape
+            rec.prepare(Size(m.width, m.height), m.fps, m.bitrate, hlg, hint)
+            recorder = rec
+            val rs = rec.inputSurface!!
+            activeTemplate = CameraDevice.TEMPLATE_RECORD
+            activeTargets = listOf(p, rs)
+            activeFps = m.fps
+            createSession(listOf(p, rs), hlg) { s ->
+                rec.start()
+                s.setRepeatingRequest(buildRequest(), captureCb, handler)
+            }
+            RecInfo(hlg, "${m.label} · HEVC " + if (hlg) "10-bit HLG" else "8-bit SDR")
+        } catch (e: Exception) {
+            Log.e(TAG, "startRecording gagal", e)
+            recorder?.stop(); recorder = null
+            null
+        }
+    }
+
+    fun stopRecording() {
+        runCatching { session?.stopRepeating() }
+        recorder?.stop()
+        recorder = null
+        startPreview()
+    }
+
+    fun close() {
+        recorder?.stop(); recorder = null
+        session?.close(); session = null
+        device?.close(); device = null
+    }
+
+    // --- White balance: estimasi gain relatif terhadap nilai auto saat AWB dimatikan ---
+    private fun gainsFor(k: Int): RggbChannelVector {
+        val base = autoGains ?: RggbChannelVector(2.0f, 1f, 1f, 1.8f)
+        val ref = kelvinRgb(5500)
+        val t = kelvinRgb(k)
+        val fr = (ref[0] / t[0]) / (ref[1] / t[1])
+        val fb = (ref[2] / t[2]) / (ref[1] / t[1])
+        return RggbChannelVector(base.red * fr, base.greenEven, base.greenOdd, base.blue * fb)
+    }
+
+    private fun kelvinRgb(k: Int): FloatArray {
+        val t = k / 100.0
+        val r = if (t <= 66) 255.0 else 329.698727446 * Math.pow(t - 60.0, -0.1332047592)
+        val g = if (t <= 66) 99.4708025861 * Math.log(t) - 161.1195681661
+        else 288.1221695283 * Math.pow(t - 60.0, -0.0755148492)
+        val b = if (t >= 66) 255.0 else if (t <= 19) 1.0
+        else 138.5177312231 * Math.log(t - 10.0) - 305.0447927307
+        fun n(v: Double) = (v / 255.0).coerceIn(0.02, 1.0).toFloat()
+        return floatArrayOf(n(r), n(g), n(b))
+    }
+}
